@@ -26,7 +26,8 @@ fi
 
 process_logs() {
     local node="$1"
-    local logs=$(oc debug node/"$node" -q -- bash -c 'chroot /host journalctl')
+    #local logs=$(oc debug node/"$node" -q -- bash -c 'chroot /host journalctl')
+    local logs=$(oc adm node-logs "$node" --path=journal)
     local aap_job_cid=$(echo "$logs" | grep -oP 'Created container [^:]+:.*-job-'"$jobid"'-[a-z0-9]+/' | grep -oP '[a-f0-9]{64}')
     if [[ -n "$aap_job_cid" ]]; then
         echo -e "\e[31mJob ID:\e[0m $jobid\n\e[31mNode:\e[0m $node\n\n\e[31mContainer ID:\e[0m $aap_job_cid\n\e[31mContainer Logs:\e[0m"
