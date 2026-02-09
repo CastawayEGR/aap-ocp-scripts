@@ -36,10 +36,22 @@ process_logs() {
         echo "Error: No job with id $jobid found."
         exit
     fi
-    local pid=$(echo "$logs" | grep 'oom-kill' | grep -oP 'pid=\K\d+')
-    if [[ -n "$pid" ]]; then
-        echo -e "\n\e[31mPID:\e[0m $pid\n\e[31mPID Logs:\e[0m"
+    # Kernel OOM: oom-kill referencing this container's cgroup
+    local kernel_oom=$(grep 'oom-kill' <<< "$logs" | grep -F "$aap_job_cid")
+    # Eviction: kubelet eviction_manager referencing this job pod
+    local eviction=$(grep 'eviction_manager' <<< "$logs" | grep "job-${jobid}")
+
+    if [[ -n "$eviction" ]]; then
+        echo -e "\n\e[31mOOM Type:\e[0m Eviction (node under memory pressure)"
+        echo -e "\e[31mEviction Logs:\e[0m"
+        echo "$eviction"
+    elif [[ -n "$kernel_oom" ]]; then
+        echo -e "\n\e[31mOOM Type:\e[0m Kernel OOM Kill (pod exceeded memory limit)"
+        local pid=$(grep -oP 'pid=\K\d+' <<< "$kernel_oom")
+        echo -e "\e[31mPID:\e[0m $pid\n\e[31mOOM Logs:\e[0m"
         grep -F "$pid" <<< "$logs"
+    else
+        echo -e "\n\e[32mNo OOM detected for this job.\e[0m"
     fi
 }
 
