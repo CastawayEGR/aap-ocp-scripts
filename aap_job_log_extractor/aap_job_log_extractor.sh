@@ -42,6 +42,69 @@ highlight_output() {
 
 setup_colors
 
+# Convert kB value to human-readable format with MB/GB suffix.
+format_kb() {
+    local kb="$1"
+    if [[ ! "$kb" =~ ^[0-9]+$ ]]; then
+        echo "${kb}kB"
+        return
+    fi
+    if [[ "$kb" -ge 1048576 ]]; then
+        printf '%skB (%.1fGB)\n' "$kb" "$(awk "BEGIN {printf \"%.1f\", $kb/1048576}")"
+    elif [[ "$kb" -ge 1024 ]]; then
+        echo "${kb}kB ($((kb / 1024))MB)"
+    else
+        echo "${kb}kB"
+    fi
+}
+
+# Extract and display memory summary from a kernel OOM event.
+# Parses the "Killed process" line for per-process memory and searches
+# backwards from the oom-kill line for cgroup usage/limit.
+display_oom_memory() {
+    local source_file="$1"
+    local pid="$2"
+    local container_id="$3"
+
+    # Per-process memory from "Killed process" line
+    local killed_line
+    killed_line=$(grep "Killed process $pid " "$source_file" | head -1)
+    if [[ -n "$killed_line" ]]; then
+        local total_vm anon_rss file_rss shmem_rss
+        total_vm=$(grep -oP 'total-vm:\K[0-9]+' <<< "$killed_line")
+        anon_rss=$(grep -oP 'anon-rss:\K[0-9]+' <<< "$killed_line")
+        file_rss=$(grep -oP 'file-rss:\K[0-9]+' <<< "$killed_line")
+        shmem_rss=$(grep -oP 'shmem-rss:\K[0-9]+' <<< "$killed_line")
+
+        echo "${RED}Process Memory (killed):${RESET}"
+        [[ -n "$total_vm" ]] && echo "  Total VM:  $(format_kb "$total_vm")"
+        [[ -n "$anon_rss" ]] && echo "  Anon RSS:  $(format_kb "$anon_rss")"
+        [[ -n "$file_rss" ]] && echo "  File RSS:  $(format_kb "$file_rss")"
+        [[ -n "$shmem_rss" ]] && echo "  Shmem RSS: $(format_kb "$shmem_rss")"
+    fi
+
+    # Cgroup memory from "memory: usage" line (appears before oom-kill in the OOM report)
+    local oom_line_num
+    oom_line_num=$(grep -n "oom-kill.*${container_id}" "$source_file" | head -1 | cut -d: -f1)
+    if [[ -n "$oom_line_num" ]]; then
+        local start=$((oom_line_num - 200))
+        [[ $start -lt 1 ]] && start=1
+        local mem_line
+        mem_line=$(sed -n "${start},${oom_line_num}p" "$source_file" | grep "memory: usage" | tail -1)
+        if [[ -n "$mem_line" ]]; then
+            local usage limit failcnt
+            usage=$(grep -oP 'usage \K[0-9]+' <<< "$mem_line" | head -1)
+            limit=$(grep -oP 'limit \K[0-9]+' <<< "$mem_line" | head -1)
+            failcnt=$(grep -oP 'failcnt \K[0-9]+' <<< "$mem_line")
+
+            echo "${RED}Cgroup Memory:${RESET}"
+            [[ -n "$usage" ]] && echo "  Usage:     $(format_kb "$usage")"
+            [[ -n "$limit" ]] && echo "  Limit:     $(format_kb "$limit")"
+            [[ -n "$failcnt" ]] && echo "  Failcnt:   $failcnt"
+        fi
+    fi
+}
+
 usage() {
     echo "Usage: $0 -s <job_id> [-n <namespace>] [-d <directory>] [-h]"
     echo ""
@@ -174,6 +237,7 @@ process_logs_offline() {
         local pid
         pid=$(grep -oP 'pid=\K\d+' <<< "$kernel_oom")
         echo "${RED}PID:${RESET} $pid"
+        display_oom_memory "$dmesg_file" "$pid" "$aap_job_cid"
         echo "${RED}OOM Logs:${RESET}"
         grep -F "$pid" "$dmesg_file" | highlight_output "${highlight_terms[@]}" "$pid"
     else
@@ -231,6 +295,7 @@ process_logs() {
         local pid
         pid=$(grep -oP 'pid=\K\d+' <<< "$kernel_oom")
         echo "${RED}PID:${RESET} $pid"
+        display_oom_memory "$tmpfile" "$pid" "$aap_job_cid"
         echo "${RED}OOM Logs:${RESET}"
         grep -F "$pid" "$tmpfile" | highlight_output "${highlight_terms[@]}" "$pid"
     else
