@@ -1,8 +1,13 @@
 #!/bin/bash
-# Script to gather an Ansible Automation Platform job pod logs from OpenShift nodes.
+# Script to gather Ansible Automation Platform job pod logs from OpenShift nodes.
 # Particularly useful for finding out if a pod was OOM killed without taking a full sosreport.
 # Supports offline analysis of pre-collected sosreport data via the -d flag.
+# Supports multiple job IDs and node label selectors for targeted node searches.
 # Author: Michael Tipton
+
+# --- Temp directory lifecycle ---
+SCRIPT_TMPDIR=$(mktemp -d) || { echo "Error: Failed to create temp directory." >&2; exit 1; }
+trap 'rm -rf "$SCRIPT_TMPDIR"' EXIT
 
 # --- Color setup ---
 # Respects NO_COLOR (https://no-color.org/) and detects non-terminal output.
@@ -106,20 +111,58 @@ display_oom_memory() {
 }
 
 usage() {
-    echo "Usage: $0 -s <job_id> [-n <namespace>] [-d <directory>] [-h]"
+    echo "Usage: $0 [OPTIONS] JOB_ID [JOB_ID ...]"
+    echo ""
+    echo "  JOB_ID              One or more numeric job IDs (positional)"
     echo ""
     echo "  Live mode (default):"
-    echo "    -s <job_id>     Specify the job ID to search for"
-    echo "    -n <namespace>  Optional: Specify the namespace where AAP jobs run (default is all namespaces)"
+    echo "    -j <job_id>       Specify a job ID (repeatable, alternative to positional)"
+    echo "    -n <namespace>    Namespace where AAP jobs run (default: all)"
+    echo "    -l <label>        Node label selector to restrict node search"
+    echo "                      (e.g., node-role.kubernetes.io/aap-worker=)"
     echo ""
-    echo "  Offline mode (sosreport analysis):"
-    echo "    -s <job_id>     Specify the job ID to search for"
-    echo "    -d <directory>  Path to directory containing extracted sosreport(s)"
-    echo "                    Sosreport directories are discovered recursively"
+    echo "  Offline mode:"
+    echo "    -d <directory>    Path to extracted sosreport(s)"
     echo ""
-    echo "  -h                Display this help message"
+    echo "  -h                  Display this help message"
     exit 1
 }
+
+# --- Output formatting ---
+
+print_job_separator() {
+    local job_id="$1"
+    local index="$2"
+    local total="$3"
+    if [[ "$total" -gt 1 ]]; then
+        [[ "$index" -gt 1 ]] && echo ""
+        echo "========================================================================"
+        echo " Job $job_id ($index/$total)"
+        echo "========================================================================"
+        echo ""
+    fi
+}
+
+print_summary() {
+    local found_count="$1"
+    local total="$2"
+    shift 2
+    local -a missing_list=("$@")
+
+    if [[ "$total" -le 1 ]]; then
+        return
+    fi
+
+    echo ""
+    echo "========================================================================"
+    echo " Summary: $found_count/$total jobs found"
+    echo "========================================================================"
+    if [[ ${#missing_list[@]} -gt 0 ]]; then
+        echo "${RED}Not found:${RESET} ${missing_list[*]}" >&2
+    fi
+}
+
+# --- Sosreport discovery ---
 
 discover_sosreports() {
     local search_dir="$1"
@@ -148,8 +191,11 @@ get_node_from_sosreport() {
     echo "$dirname" | sed -E 's/^sosreport-//;s/-[0-9]{4}-[0-9]{2}-[0-9]{2}-.*//'
 }
 
+# --- Offline processing ---
+
 process_logs_offline() {
     local sos_root="$1"
+    local jobid="$2"
     local kubelet_journal="$sos_root/sos_commands/openshift/journalctl_--no-pager_--unit_kubelet"
     local dmesg_file="$sos_root/sos_commands/kernel/dmesg_-T"
     local node
@@ -160,10 +206,15 @@ process_logs_offline() {
     aap_job_cid=$(grep -- "job-${jobid}" "$kubelet_journal" | \
         grep -oP 'containerName="worker"\s+containerID="cri-o://\K[a-f0-9]{64}' | head -1)
 
-    # Tier 2: generic.go "container finished" containerID="{64hex}" (container exits any reason)
-    if [[ -z "$aap_job_cid" ]]; then
-        aap_job_cid=$(grep -- "job-${jobid}" "$kubelet_journal" | \
-            grep 'container finished' | grep -oP 'containerID="\K[a-f0-9]{64}' | head -1)
+    # Extract pod UUID from kubelet journal (PLEG events, topology_manager, etc.)
+    local pod_uid
+    pod_uid=$(grep -- "job-${jobid}" "$kubelet_journal" | \
+        grep -oP '"ID":"?\K[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}' | head -1)
+
+    # Tier 2: use pod UUID to find "container finished" line (references pod by UUID, not name)
+    if [[ -z "$aap_job_cid" ]] && [[ -n "$pod_uid" ]]; then
+        aap_job_cid=$(grep 'container finished' "$kubelet_journal" | grep "$pod_uid" | \
+            grep -oP 'containerID="\K[a-f0-9]{64}' | head -1)
     fi
 
     # Tier 3: PLEG ContainerStarted "Data":"{64hex}" (always present, may have multiple)
@@ -182,12 +233,12 @@ process_logs_offline() {
                     break
                 fi
             done
-            # If no OOM match, take the last candidate (last started is typically worker)
+            # If no OOM match, take the first candidate (first started is typically worker)
             if [[ -z "$aap_job_cid" ]]; then
-                aap_job_cid="${candidates[-1]}"
+                aap_job_cid="${candidates[0]}"
             fi
         elif [[ ${#candidates[@]} -gt 1 ]]; then
-            aap_job_cid="${candidates[-1]}"
+            aap_job_cid="${candidates[0]}"
         fi
     fi
 
@@ -217,11 +268,24 @@ process_logs_offline() {
     local eviction
     eviction=$(grep 'eviction_manager' "$kubelet_journal" | grep -- "job-${jobid}")
 
-    # Check for kernel OOM in dmesg
+    # Check for kernel OOM in dmesg, then fall back to boot journal
     local kernel_oom=""
+    local oom_source=""
     if [[ -f "$dmesg_file" ]]; then
         kernel_oom=$(grep 'oom-kill' "$dmesg_file" | grep -F "$aap_job_cid")
-    else
+        [[ -n "$kernel_oom" ]] && oom_source="$dmesg_file"
+    fi
+
+    # Fallback: check full boot journal (journald persists kernel messages beyond dmesg ring buffer)
+    if [[ -z "$kernel_oom" ]]; then
+        local boot_journal="$sos_root/sos_commands/logs/journalctl_--no-pager_--boot"
+        if [[ -f "$boot_journal" ]]; then
+            kernel_oom=$(grep 'oom-kill' "$boot_journal" | grep -F "$aap_job_cid")
+            [[ -n "$kernel_oom" ]] && oom_source="$boot_journal"
+        fi
+    fi
+
+    if [[ -z "$kernel_oom" ]] && [[ ! -f "$dmesg_file" ]]; then
         echo ""
         echo "${YELLOW}Warning: dmesg_-T not found; kernel OOM detection limited to kubelet journal.${RESET}"
     fi
@@ -237,9 +301,9 @@ process_logs_offline() {
         local pid
         pid=$(grep -oP 'pid=\K\d+' <<< "$kernel_oom")
         echo "${RED}PID:${RESET} $pid"
-        display_oom_memory "$dmesg_file" "$pid" "$aap_job_cid"
+        display_oom_memory "$oom_source" "$pid" "$aap_job_cid"
         echo "${RED}OOM Logs:${RESET}"
-        grep -F "$pid" "$dmesg_file" | highlight_output "${highlight_terms[@]}" "$pid"
+        grep -F "$pid" "$oom_source" | highlight_output "${highlight_terms[@]}" "$pid"
     else
         echo ""
         echo "${GREEN}No OOM detected for this job.${RESET}"
@@ -248,20 +312,41 @@ process_logs_offline() {
     return 0
 }
 
-process_logs() {
+# --- Live mode functions ---
+
+# Fetch a node's journal to the cache. Reuses cached file if already fetched.
+# Sets NODE_JOURNAL_CACHE[$node] to the cached file path.
+# Returns 1 on fetch failure.
+fetch_node_journal() {
     local node="$1"
-    local tmpfile
-    tmpfile=$(mktemp) || { echo "Error: Failed to create temp file."; return 1; }
-    # shellcheck disable=SC2064
-    trap "rm -f '$tmpfile'" RETURN
+
+    # Reuse cache if already fetched
+    if [[ -n "${NODE_JOURNAL_CACHE[$node]+x}" ]]; then
+        return 0
+    fi
+
+    local safe_name="${node//\//_}"
+    local tmpfile="$SCRIPT_TMPDIR/journal_${safe_name}"
 
     if ! oc adm node-logs "$node" --path=journal > "$tmpfile" 2>&1; then
-        echo "Error: Failed to fetch journal from node $node."
+        echo "Error: Failed to fetch journal from node $node." >&2
         return 1
     fi
 
+    NODE_JOURNAL_CACHE[$node]="$tmpfile"
+    return 0
+}
+
+# Search for a job in an already-fetched journal file.
+# Outputs all results (container ID, logs, OOM detection).
+# Returns 1 if job not found in journal.
+search_job_in_journal() {
+    local journal_file="$1"
+    local jobid="$2"
+    local node="$3"
+
     local aap_job_cid
-    aap_job_cid=$(grep -oP 'Created container [^:]+:.*-job-'"$jobid"'-[a-z0-9]+/' "$tmpfile" | grep -oP '[a-f0-9]{64}')
+    aap_job_cid=$(grep -oP 'Created container [^:]+:.*-job-'"$jobid"'-[a-z0-9]+/' "$journal_file" | grep -oP '[a-f0-9]{64}')
 
     if [[ -z "$aap_job_cid" ]]; then
         return 1
@@ -274,15 +359,15 @@ process_logs() {
     echo ""
     echo "${RED}Container ID:${RESET} ${HIGHLIGHT}${aap_job_cid}${RESET}"
     echo "${RED}Container Logs:${RESET}"
-    grep -F "$aap_job_cid" "$tmpfile" | highlight_output "${highlight_terms[@]}"
+    grep -F "$aap_job_cid" "$journal_file" | highlight_output "${highlight_terms[@]}"
 
     # Note: In live mode, oc adm node-logs --path=journal returns the full systemd journal,
     # which includes kernel messages (journald imports them by default on RHCOS).
     # This differs from offline mode where only the kubelet-filtered journal is available.
     local kernel_oom
-    kernel_oom=$(grep 'oom-kill' "$tmpfile" | grep -F "$aap_job_cid")
+    kernel_oom=$(grep 'oom-kill' "$journal_file" | grep -F "$aap_job_cid")
     local eviction
-    eviction=$(grep 'eviction_manager' "$tmpfile" | grep -- "job-${jobid}")
+    eviction=$(grep 'eviction_manager' "$journal_file" | grep -- "job-${jobid}")
 
     if [[ -n "$eviction" ]]; then
         echo ""
@@ -295,9 +380,9 @@ process_logs() {
         local pid
         pid=$(grep -oP 'pid=\K\d+' <<< "$kernel_oom")
         echo "${RED}PID:${RESET} $pid"
-        display_oom_memory "$tmpfile" "$pid" "$aap_job_cid"
+        display_oom_memory "$journal_file" "$pid" "$aap_job_cid"
         echo "${RED}OOM Logs:${RESET}"
-        grep -F "$pid" "$tmpfile" | highlight_output "${highlight_terms[@]}" "$pid"
+        grep -F "$pid" "$journal_file" | highlight_output "${highlight_terms[@]}" "$pid"
     else
         echo ""
         echo "${GREEN}No OOM detected for this job.${RESET}"
@@ -306,107 +391,260 @@ process_logs() {
     return 0
 }
 
+# Phase 1: Resolve jobs to nodes via cluster events.
+# Populates NODE_TO_JOBS, JOB_TO_NODE; remaining go to UNRESOLVED_JOBS.
+resolve_jobs_from_events() {
+    local event_json="$1"
+    shift
+    local -a job_ids=("$@")
+
+    for jobid in "${job_ids[@]}"; do
+        local node
+        node=$(jq -r --arg jobid "$jobid" \
+            '.items[] | select(.message | test("assigned.*job-\($jobid)")).message' \
+            <<< "$event_json" | awk '{ print $5 }' | head -1)
+
+        if [[ -n "$node" ]]; then
+            JOB_TO_NODE[$jobid]="$node"
+            if [[ -n "${NODE_TO_JOBS[$node]+x}" ]]; then
+                NODE_TO_JOBS[$node]+=" $jobid"
+            else
+                NODE_TO_JOBS[$node]="$jobid"
+            fi
+        else
+            UNRESOLVED_JOBS+=("$jobid")
+        fi
+    done
+}
+
+# Phase 2: Brute-force resolve remaining jobs by fetching node journals.
+# Updates NODE_TO_JOBS, JOB_TO_NODE; removes resolved from UNRESOLVED_JOBS.
+bruteforce_resolve_jobs() {
+    local node_label="${NODE_LABEL_SELECTOR:-node-role.kubernetes.io/worker}"
+
+    local worker_nodes
+    worker_nodes=$(oc get nodes -l "$node_label" -o jsonpath='{.items[*].metadata.name}') || {
+        echo "Error: Failed to fetch nodes with label '$node_label'." >&2
+        exit 1
+    }
+    if [[ -z "$worker_nodes" ]]; then
+        echo "Error: No nodes found matching label '$node_label'." >&2
+        exit 1
+    fi
+
+    for node in $worker_nodes; do
+        if [[ ${#UNRESOLVED_JOBS[@]} -eq 0 ]]; then
+            break
+        fi
+
+        if ! fetch_node_journal "$node"; then
+            continue
+        fi
+
+        local journal_file="${NODE_JOURNAL_CACHE[$node]}"
+        local -a still_unresolved=()
+
+        for jobid in "${UNRESOLVED_JOBS[@]}"; do
+            if grep -qP 'Created container [^:]+:.*-job-'"$jobid"'-[a-z0-9]+/' "$journal_file"; then
+                JOB_TO_NODE[$jobid]="$node"
+                if [[ -n "${NODE_TO_JOBS[$node]+x}" ]]; then
+                    NODE_TO_JOBS[$node]+=" $jobid"
+                else
+                    NODE_TO_JOBS[$node]="$jobid"
+                fi
+            else
+                still_unresolved+=("$jobid")
+            fi
+        done
+
+        UNRESOLVED_JOBS=("${still_unresolved[@]}")
+    done
+}
+
 # --- Argument parsing ---
-while getopts "s:n:d:h" flag; do
+
+declare -a JOB_IDS_RAW=()
+namespace=""
+sosreport_dir=""
+NODE_LABEL_SELECTOR=""
+
+while getopts "j:n:d:l:h" flag; do
     case "${flag}" in
-        s) jobid=${OPTARG} ;;
-        n) namespace=${OPTARG} ;;
-        d) sosreport_dir=${OPTARG} ;;
+        j) JOB_IDS_RAW+=("$OPTARG") ;;
+        n) namespace="$OPTARG" ;;
+        d) sosreport_dir="$OPTARG" ;;
+        l) NODE_LABEL_SELECTOR="$OPTARG" ;;
         h) usage ;;
         *) usage ;;
     esac
 done
+shift $((OPTIND - 1))
 
-if [[ -z "${jobid:-}" ]]; then
-    echo "Error: Missing job id parameter (-s)"
+# Append positional arguments
+JOB_IDS_RAW+=("$@")
+
+if [[ ${#JOB_IDS_RAW[@]} -eq 0 ]]; then
+    echo "Error: At least one job ID is required." >&2
     usage
 fi
 
-# Validate job ID is numeric
-if ! [[ "$jobid" =~ ^[0-9]+$ ]]; then
-    echo "Error: Job ID must be numeric, got '$jobid'"
-    exit 1
-fi
+# Validate all job IDs are numeric
+for id in "${JOB_IDS_RAW[@]}"; do
+    if ! [[ "$id" =~ ^[0-9]+$ ]]; then
+        echo "Error: Job ID must be numeric, got '$id'" >&2
+        exit 1
+    fi
+done
 
-if [[ -n "${sosreport_dir:-}" ]]; then
-    # Offline mode: analyze sosreport data
-    if [[ -n "${namespace:-}" ]]; then
-        echo "${YELLOW}Warning: -n (namespace) is ignored in offline mode.${RESET}"
+# Deduplicate job IDs while preserving order
+declare -A SEEN_IDS
+declare -a JOB_IDS=()
+for id in "${JOB_IDS_RAW[@]}"; do
+    if [[ -z "${SEEN_IDS[$id]+x}" ]]; then
+        SEEN_IDS[$id]=1
+        JOB_IDS+=("$id")
+    fi
+done
+unset SEEN_IDS
+
+total=${#JOB_IDS[@]}
+found_count=0
+declare -a missing_jobs=()
+
+if [[ -n "${sosreport_dir}" ]]; then
+    # --- Offline mode ---
+    if [[ -n "${namespace}" ]]; then
+        echo "${YELLOW}Warning: -n (namespace) is ignored in offline mode.${RESET}" >&2
+    fi
+    if [[ -n "${NODE_LABEL_SELECTOR}" ]]; then
+        echo "${YELLOW}Warning: -l (node label selector) is ignored in offline mode.${RESET}" >&2
     fi
 
     if [[ ! -d "$sosreport_dir" ]]; then
-        echo "Error: Directory '$sosreport_dir' does not exist."
+        echo "Error: Directory '$sosreport_dir' does not exist." >&2
         exit 1
     fi
 
     mapfile -t sos_roots < <(discover_sosreports "$sosreport_dir")
 
     if [[ ${#sos_roots[@]} -eq 0 ]]; then
-        echo "Error: No sosreport directories found under '$sosreport_dir'."
-        echo "Expected structure: <dir>/sos_commands/openshift/journalctl_--no-pager_--unit_kubelet"
+        echo "Error: No sosreport directories found under '$sosreport_dir'." >&2
+        echo "Expected structure: <dir>/sos_commands/openshift/journalctl_--no-pager_--unit_kubelet" >&2
         exit 1
     fi
 
-    found=false
-    for sos_root in "${sos_roots[@]}"; do
-        kubelet_journal="$sos_root/sos_commands/openshift/journalctl_--no-pager_--unit_kubelet"
-        if grep -q -- "job-${jobid}" "$kubelet_journal" 2>/dev/null; then
-            process_logs_offline "$sos_root"
-            found=true
-            break
+    index=0
+    for jobid in "${JOB_IDS[@]}"; do
+        index=$((index + 1))
+        print_job_separator "$jobid" "$index" "$total"
+
+        job_found=false
+        for sos_root in "${sos_roots[@]}"; do
+            kubelet_journal="$sos_root/sos_commands/openshift/journalctl_--no-pager_--unit_kubelet"
+            if grep -q -- "job-${jobid}" "$kubelet_journal" 2>/dev/null; then
+                if process_logs_offline "$sos_root" "$jobid"; then
+                    job_found=true
+                    break
+                fi
+            fi
+        done
+
+        if [[ "$job_found" == "true" ]]; then
+            found_count=$((found_count + 1))
+        else
+            echo "Error: No job with id $jobid found in ${#sos_roots[@]} sosreport(s) searched." >&2
+            missing_jobs+=("$jobid")
         fi
     done
 
-    if [[ "$found" != "true" ]]; then
-        echo "Error: No job with id $jobid found in ${#sos_roots[@]} sosreport(s) searched."
-        exit 1
-    fi
+    print_summary "$found_count" "$total" "${missing_jobs[@]}"
 else
-    # Live mode: requires oc and jq
+    # --- Live mode ---
     if ! command -v oc &>/dev/null; then
-        echo "Error: 'oc' command not found. Please make sure OpenShift CLI is installed and in your PATH."
+        echo "Error: 'oc' command not found. Please make sure OpenShift CLI is installed and in your PATH." >&2
         exit 1
     fi
 
     if ! command -v jq &>/dev/null; then
-        echo "Error: 'jq' command not found. Please make sure 'jq' is installed and in your PATH."
+        echo "Error: 'jq' command not found. Please make sure 'jq' is installed and in your PATH." >&2
         exit 1
     fi
 
-    if [[ -z "${namespace:-}" ]]; then
-        event_json=$(oc get events -o json) || { echo "Error: Failed to fetch cluster events."; exit 1; }
+    # Data structures for node-centric processing
+    declare -A NODE_TO_JOBS
+    declare -A JOB_TO_NODE
+    declare -a UNRESOLVED_JOBS=()
+    declare -A NODE_JOURNAL_CACHE
+
+    # Phase 1: Event resolution
+    local_event_json=""
+    if [[ -z "${namespace}" ]]; then
+        local_event_json=$(oc get events -o json) || { echo "Error: Failed to fetch cluster events." >&2; exit 1; }
     else
-        event_json=$(oc get events -n "$namespace" -o json) || { echo "Error: Failed to fetch events from namespace '$namespace'."; exit 1; }
+        local_event_json=$(oc get events -n "$namespace" -o json) || { echo "Error: Failed to fetch events from namespace '$namespace'." >&2; exit 1; }
     fi
 
-    aap_worker_node=$(jq -r --arg jobid "$jobid" '.items[] | select(.message | test("assigned.*job-\($jobid)")).message' <<< "$event_json" | awk '{ print $5 }')
+    resolve_jobs_from_events "$local_event_json" "${JOB_IDS[@]}"
 
-    if [[ -z "$aap_worker_node" ]]; then
-        worker_nodes=$(oc get nodes -l node-role.kubernetes.io/worker -o jsonpath={.items[*].metadata.name}) || {
-            echo "Error: Failed to fetch worker nodes."
-            exit 1
-        }
-        if [[ -z "$worker_nodes" ]]; then
-            echo "Error: No worker nodes found."
-            exit 1
+    # Phase 2: Brute-force resolution for unresolved jobs
+    if [[ ${#UNRESOLVED_JOBS[@]} -gt 0 ]]; then
+        bruteforce_resolve_jobs
+    fi
+
+    # Phase 3: Process all resolved jobs, node by node
+    declare -A PROCESSED_JOBS
+    index=0
+    for node in "${!NODE_TO_JOBS[@]}"; do
+        if ! fetch_node_journal "$node"; then
+            # Mark all jobs on this node as missing
+            for jobid in ${NODE_TO_JOBS[$node]}; do
+                if [[ -z "${PROCESSED_JOBS[$jobid]+x}" ]]; then
+                    PROCESSED_JOBS[$jobid]=1
+                    missing_jobs+=("$jobid")
+                fi
+            done
+            continue
         fi
-        found=false
-        for node in $worker_nodes; do
-            if process_logs "$node"; then
-                found=true
-                break
+
+        journal_file="${NODE_JOURNAL_CACHE[$node]}"
+
+        for jobid in ${NODE_TO_JOBS[$node]}; do
+            if [[ -n "${PROCESSED_JOBS[$jobid]+x}" ]]; then
+                continue
+            fi
+            PROCESSED_JOBS[$jobid]=1
+            index=$((index + 1))
+            print_job_separator "$jobid" "$index" "$total"
+
+            if search_job_in_journal "$journal_file" "$jobid" "$node"; then
+                found_count=$((found_count + 1))
+            else
+                echo "Error: No job with id $jobid found on node $node." >&2
+                missing_jobs+=("$jobid")
             fi
         done
-        if [[ "$found" != "true" ]]; then
-            echo "Error: No job with id $jobid found on any worker node."
-            exit 1
+    done
+
+    # Any jobs still in UNRESOLVED_JOBS after brute-force are missing
+    for jobid in "${UNRESOLVED_JOBS[@]}"; do
+        if [[ -z "${PROCESSED_JOBS[$jobid]+x}" ]]; then
+            PROCESSED_JOBS[$jobid]=1
+            index=$((index + 1))
+            print_job_separator "$jobid" "$index" "$total"
+            echo "Error: No job with id $jobid found on any worker node." >&2
+            missing_jobs+=("$jobid")
         fi
-    else
-        if ! process_logs "$aap_worker_node"; then
-            echo "Error: No job with id $jobid found on node $aap_worker_node."
-            exit 1
-        fi
-    fi
+    done
+
+    # Phase 4: Summary
+    print_summary "$found_count" "$total" "${missing_jobs[@]}"
 fi
 
-exit 0
+# Exit codes: 0 = all found, 1 = none found, 2 = partial
+if [[ "$found_count" -eq "$total" ]]; then
+    exit 0
+elif [[ "$found_count" -eq 0 ]]; then
+    exit 1
+else
+    exit 2
+fi
