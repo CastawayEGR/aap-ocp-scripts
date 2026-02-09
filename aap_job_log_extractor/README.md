@@ -22,7 +22,7 @@ The script supports two modes:
 
 ### Options
 
-- `-s <job_id>`: Specifies the AAP job ID to search for.
+- `-s <job_id>`: Specifies the AAP job ID to search for (must be numeric).
 - `-n <namespace>`: (Optional, live mode only) Specifies the namespace AAP jobs are run to search within. If not provided, searches across all namespaces.
 - `-d <directory>`: Path to a directory containing extracted sosreport(s). Sosreport directories are discovered recursively. When provided, the script operates entirely offline.
 - `-h`: Displays the help menu.
@@ -86,6 +86,10 @@ Sosreport directories must be pre-extracted (`.tar.xz` archives are not automati
 ### Offline Mode
 - No external tools required beyond standard bash utilities.
 - Extracted sosreport directories with kubelet journal data.
+
+## Color Output
+
+When run in a terminal, the script highlights matched values (job ID, container ID, `oom-kill`, `eviction`) inline within log output for easier scanning. Color is automatically disabled when output is piped or redirected. Set `NO_COLOR=1` to disable color explicitly.
 
 ## License
 
