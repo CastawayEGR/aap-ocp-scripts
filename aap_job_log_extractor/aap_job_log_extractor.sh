@@ -88,24 +88,29 @@ display_oom_memory() {
         [[ -n "$shmem_rss" ]] && echo "  Shmem RSS: $(format_kb "$shmem_rss")"
     fi
 
-    # Cgroup memory from "memory: usage" line (appears before oom-kill in the OOM report)
+    # Cgroup memory from "memory: usage" line within the same OOM report.
+    # Find the oom-kill: line for our container, then search backward for
+    # "invoked oom-killer" to locate the report's start boundary.  This avoids
+    # a fixed lookback window that can miss data when the process list is large.
     local oom_line_num
     oom_line_num=$(grep -n "oom-kill.*${container_id}" "$source_file" | head -1 | cut -d: -f1)
     if [[ -n "$oom_line_num" ]]; then
-        local start=$((oom_line_num - 200))
-        [[ $start -lt 1 ]] && start=1
-        local mem_line
-        mem_line=$(sed -n "${start},${oom_line_num}p" "$source_file" | grep "memory: usage" | tail -1)
-        if [[ -n "$mem_line" ]]; then
-            local usage limit failcnt
-            usage=$(grep -oP 'usage \K[0-9]+' <<< "$mem_line" | head -1)
-            limit=$(grep -oP 'limit \K[0-9]+' <<< "$mem_line" | head -1)
-            failcnt=$(grep -oP 'failcnt \K[0-9]+' <<< "$mem_line")
+        local report_start
+        report_start=$(sed -n "1,${oom_line_num}p" "$source_file" | grep -n "invoked oom-killer" | tail -1 | cut -d: -f1)
+        if [[ -n "$report_start" ]]; then
+            local mem_line
+            mem_line=$(sed -n "${report_start},${oom_line_num}p" "$source_file" | grep "memory: usage" | tail -1)
+            if [[ -n "$mem_line" ]]; then
+                local usage limit failcnt
+                usage=$(grep -oP 'usage \K[0-9]+' <<< "$mem_line" | head -1)
+                limit=$(grep -oP 'limit \K[0-9]+' <<< "$mem_line" | head -1)
+                failcnt=$(grep -oP 'failcnt \K[0-9]+' <<< "$mem_line")
 
-            echo "${RED}Cgroup Memory:${RESET}"
-            [[ -n "$usage" ]] && echo "  Usage:     $(format_kb "$usage")"
-            [[ -n "$limit" ]] && echo "  Limit:     $(format_kb "$limit")"
-            [[ -n "$failcnt" ]] && echo "  Failcnt:   $failcnt"
+                echo "${RED}Cgroup Memory:${RESET}"
+                [[ -n "$usage" ]] && echo "  Usage:     $(format_kb "$usage")"
+                [[ -n "$limit" ]] && echo "  Limit:     $(format_kb "$limit")"
+                [[ -n "$failcnt" ]] && echo "  Failcnt:   $failcnt"
+            fi
         fi
     fi
 }
