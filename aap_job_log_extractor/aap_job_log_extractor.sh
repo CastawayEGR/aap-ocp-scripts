@@ -87,12 +87,13 @@ display_oom_memory() {
     local report_block
     report_block=$(sed -n "${report_start},${oom_line_num}p" "$source_file")
 
-    # Per-process memory from "Killed process" line (often right after block; fallback to one grep on file).
+    # Per-process memory from "Killed process" line (parse now, display last).
     local killed_line
     killed_line=$(grep "Killed process $pid " <<< "$report_block" | head -1)
     [[ -z "$killed_line" ]] && killed_line=$(grep "Killed process $pid " "$source_file" | head -1)
+    local anon_rss file_rss shmem_rss proc_name
     if [[ -n "$killed_line" ]]; then
-        local total_vm anon_rss file_rss shmem_rss
+        local total_vm
         read -r total_vm anon_rss file_rss shmem_rss < <(
             awk '
                 function after(s, sep,   i) { i = index(s, sep); return i ? substr(s, i + length(sep)) : "" }
@@ -101,12 +102,8 @@ display_oom_memory() {
                 END { print tv+0, ar+0, fr+0, sr+0 }
             ' <<< "$killed_line"
         ) || true
-        echo "${RED}Process Memory (killed):${RESET}"
-        echo "  (OOM victim only; cgroup limit applies to all processes below)"
-        [[ -n "$total_vm" ]] && echo "  Total VM:  $(format_kb "$total_vm")"
-        [[ -n "$anon_rss" ]] && echo "  Anon RSS:  $(format_kb "$anon_rss")"
-        [[ -n "$file_rss" ]] && echo "  File RSS:  $(format_kb "$file_rss")"
-        [[ -n "$shmem_rss" ]] && echo "  Shmem RSS: $(format_kb "$shmem_rss")"
+        local re='Killed process [0-9]+ \(([^)]+)\)'
+        [[ "$killed_line" =~ $re ]] && proc_name="${BASH_REMATCH[1]}"
     fi
 
     # Cgroup memory: one grep in block, one awk for usage/limit/failcnt.
@@ -172,6 +169,15 @@ display_oom_memory() {
                 fi
             done <<< "$tasks_summary"
         fi
+    fi
+
+    # OOM victim details (from the "Killed process" line parsed above).
+    if [[ -n "$killed_line" ]]; then
+        echo "${RED}OOM Victim:${RESET}"
+        [[ -n "$proc_name" ]] && echo "  Process:   $proc_name (PID $pid)"
+        [[ -n "$anon_rss" ]] && echo "  Anon RSS:  $(format_kb "$anon_rss")"
+        [[ -n "$file_rss" ]] && echo "  File RSS:  $(format_kb "$file_rss")"
+        [[ -n "$shmem_rss" ]] && echo "  Shmem RSS: $(format_kb "$shmem_rss")"
     fi
 }
 
