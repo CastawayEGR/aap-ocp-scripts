@@ -47,7 +47,7 @@ highlight_output() {
 
 setup_colors
 
-# Convert kB value to human-readable format with MB/GB suffix.
+# Convert kB value to human-readable format with MB/GB suffix. Pure bash, no awk.
 format_kb() {
     local kb="$1"
     if [[ ! "$kb" =~ ^[0-9]+$ ]]; then
@@ -55,7 +55,9 @@ format_kb() {
         return
     fi
     if [[ "$kb" -ge 1048576 ]]; then
-        printf '%skB (%.1fGB)\n' "$kb" "$(awk "BEGIN {printf \"%.1f\", $kb/1048576}")"
+        local gb_int=$((kb / 1048576))
+        local gb_frac=$(( (kb % 1048576) * 10 / 1048576 ))
+        printf '%skB (%d.%dGB)\n' "$kb" "$gb_int" "$gb_frac"
     elif [[ "$kb" -ge 1024 ]]; then
         echo "${kb}kB ($((kb / 1024))MB)"
     else
@@ -64,53 +66,111 @@ format_kb() {
 }
 
 # Extract and display memory summary from a kernel OOM event.
-# Parses the "Killed process" line for per-process memory and searches
-# backwards from the oom-kill line for cgroup usage/limit.
+# One awk pass to find report bounds, one sed to extract block, then parse in memory.
 display_oom_memory() {
     local source_file="$1"
     local pid="$2"
     local container_id="$3"
 
-    # Per-process memory from "Killed process" line
+    # One awk pass: find last "invoked oom-killer" before "oom-kill" line containing container_id.
+    local report_start oom_line_num
+    read -r report_start oom_line_num < <(
+        awk -v cid="$container_id" '
+            index($0, "invoked oom-killer") { start = NR }
+            index($0, "oom-kill") && index($0, cid) { oom = NR; exit }
+            END { if (oom) print start, oom }
+        ' "$source_file"
+    ) || true
+    [[ -z "$report_start" || -z "$oom_line_num" ]] && return
+
+    # Single sed extract for the OOM report block.
+    local report_block
+    report_block=$(sed -n "${report_start},${oom_line_num}p" "$source_file")
+
+    # Per-process memory from "Killed process" line (often right after block; fallback to one grep on file).
     local killed_line
-    killed_line=$(grep "Killed process $pid " "$source_file" | head -1)
+    killed_line=$(grep "Killed process $pid " <<< "$report_block" | head -1)
+    [[ -z "$killed_line" ]] && killed_line=$(grep "Killed process $pid " "$source_file" | head -1)
     if [[ -n "$killed_line" ]]; then
         local total_vm anon_rss file_rss shmem_rss
-        total_vm=$(grep -oP 'total-vm:\K[0-9]+' <<< "$killed_line")
-        anon_rss=$(grep -oP 'anon-rss:\K[0-9]+' <<< "$killed_line")
-        file_rss=$(grep -oP 'file-rss:\K[0-9]+' <<< "$killed_line")
-        shmem_rss=$(grep -oP 'shmem-rss:\K[0-9]+' <<< "$killed_line")
-
+        read -r total_vm anon_rss file_rss shmem_rss < <(
+            awk '
+                function after(s, sep,   i) { i = index(s, sep); return i ? substr(s, i + length(sep)) : "" }
+                function first_num(s,   n) { return match(s, /[0-9]+/) ? substr(s, RSTART, RLENGTH)+0 : 0 }
+                { tv = first_num(after($0, "total-vm:")); ar = first_num(after($0, "anon-rss:")); fr = first_num(after($0, "file-rss:")); sr = first_num(after($0, "shmem-rss:")) }
+                END { print tv+0, ar+0, fr+0, sr+0 }
+            ' <<< "$killed_line"
+        ) || true
         echo "${RED}Process Memory (killed):${RESET}"
+        echo "  (OOM victim only; cgroup limit applies to all processes below)"
         [[ -n "$total_vm" ]] && echo "  Total VM:  $(format_kb "$total_vm")"
         [[ -n "$anon_rss" ]] && echo "  Anon RSS:  $(format_kb "$anon_rss")"
         [[ -n "$file_rss" ]] && echo "  File RSS:  $(format_kb "$file_rss")"
         [[ -n "$shmem_rss" ]] && echo "  Shmem RSS: $(format_kb "$shmem_rss")"
     fi
 
-    # Cgroup memory from "memory: usage" line within the same OOM report.
-    # Find the oom-kill: line for our container, then search backward for
-    # "invoked oom-killer" to locate the report's start boundary.  This avoids
-    # a fixed lookback window that can miss data when the process list is large.
-    local oom_line_num
-    oom_line_num=$(grep -n "oom-kill.*${container_id}" "$source_file" | head -1 | cut -d: -f1)
-    if [[ -n "$oom_line_num" ]]; then
-        local report_start
-        report_start=$(sed -n "1,${oom_line_num}p" "$source_file" | grep -n "invoked oom-killer" | tail -1 | cut -d: -f1)
-        if [[ -n "$report_start" ]]; then
-            local mem_line
-            mem_line=$(sed -n "${report_start},${oom_line_num}p" "$source_file" | grep "memory: usage" | tail -1)
-            if [[ -n "$mem_line" ]]; then
-                local usage limit failcnt
-                usage=$(grep -oP 'usage \K[0-9]+' <<< "$mem_line" | head -1)
-                limit=$(grep -oP 'limit \K[0-9]+' <<< "$mem_line" | head -1)
-                failcnt=$(grep -oP 'failcnt \K[0-9]+' <<< "$mem_line")
+    # Cgroup memory: one grep in block, one awk for usage/limit/failcnt.
+    local mem_line
+    mem_line=$(grep "memory: usage" <<< "$report_block" | tail -1)
+    if [[ -n "$mem_line" ]]; then
+        local usage limit failcnt
+        read -r usage limit failcnt < <(
+            awk '
+                match($0, /usage [0-9]+/) { u = substr($0, RSTART+6, RLENGTH-6)+0 }
+                match($0, /limit [0-9]+/) { l = substr($0, RSTART+6, RLENGTH-6)+0 }
+                match($0, /failcnt [0-9]+/) { f = substr($0, RSTART+8, RLENGTH-8)+0 }
+                END { print u+0, l+0, f+0 }
+            ' <<< "$mem_line"
+        ) || true
+        echo "${RED}Cgroup Memory:${RESET}"
+        [[ -n "$usage" ]] && echo "  Usage:     $(format_kb "$usage")"
+        [[ -n "$limit" ]] && echo "  Limit:     $(format_kb "$limit")"
+        [[ -n "$failcnt" ]] && echo "  Failcnt:   $failcnt"
+    fi
 
-                echo "${RED}Cgroup Memory:${RESET}"
-                [[ -n "$usage" ]] && echo "  Usage:     $(format_kb "$usage")"
-                [[ -n "$limit" ]] && echo "  Limit:     $(format_kb "$limit")"
-                [[ -n "$failcnt" ]] && echo "  Failcnt:   $failcnt"
-            fi
+    # Tasks state: parse from block (one sed to get section, one awk for summary).
+    local tasks_section
+    tasks_section=$(sed -n '/^.*Tasks state (memory values in pages):$/,$p' <<< "$report_block" | sed '$d')
+    if [[ -n "$tasks_section" ]]; then
+        local tasks_summary
+        tasks_summary=$(awk '
+            match($0, /\[ *[0-9]+ *\]/) {
+                s = substr($0, RSTART + RLENGTH);
+                gsub(/^[ \t]+/, "", s);
+                n = split(s, a, /[ \t]+/);
+                if (n >= 8 && a[4] ~ /^[0-9]+$/) {
+                    rss_kb = a[4] * 4;
+                    name = a[8];
+                    for (i = 9; i <= n; i++) name = name " " a[i];
+                    if (name == "") name = "(unknown)";
+                    rss_by_name[name] += rss_kb;
+                    count_by_name[name]++;
+                }
+            }
+            END {
+                total_kb = 0;
+                for (n in rss_by_name) {
+                    total_kb += rss_by_name[n];
+                    printf "%d %s %d\n", count_by_name[n], n, rss_by_name[n];
+                }
+                printf "TOTAL %d\n", total_kb;
+            }
+        ' <<< "$tasks_section")
+        if [[ -n "$tasks_summary" ]]; then
+            echo "${RED}Tasks in cgroup (RSS by process name):${RESET}"
+            echo "  (Same pod: kernel CONSTRAINT_MEMCG report lists only this cgroup's tasks.)"
+            local total_kb line
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^TOTAL\ ([0-9]+)$ ]]; then
+                    total_kb="${BASH_REMATCH[1]}"
+                    echo "  Total RSS (all tasks): $(format_kb "$total_kb")"
+                    echo "  (Sum of process RSS; may differ from cgroup usage due to shared memory.)"
+                else
+                    local cnt n rss_kb
+                    read -r cnt n rss_kb <<< "$line"
+                    [[ -n "$cnt" && -n "$n" && -n "$rss_kb" ]] && echo "  ${cnt}× $n: $(format_kb "$rss_kb")"
+                fi
+            done <<< "$tasks_summary"
         fi
     fi
 }
@@ -206,39 +266,40 @@ process_logs_offline() {
     local node
     node=$(get_node_from_sosreport "$sos_root")
 
-    # Tier 1: containerName="worker" containerID="cri-o://{64hex}" (kubelet actively kills container)
+    # Single read: all kubelet lines for this job (reused for cid, pod_uid, eviction, logs).
+    local job_lines
+    job_lines=$(grep -- "job-${jobid}" "$kubelet_journal")
+
+    # Tier 1: containerName="worker" containerID="cri-o://{64hex}"
     local aap_job_cid
-    aap_job_cid=$(grep -- "job-${jobid}" "$kubelet_journal" | \
-        grep -oP 'containerName="worker"\s+containerID="cri-o://\K[a-f0-9]{64}' | head -1)
+    aap_job_cid=$(echo "$job_lines" | grep -oP 'containerName="worker"\s+containerID="cri-o://\K[a-f0-9]{64}' | head -1)
 
-    # Extract pod UUID from kubelet journal (PLEG events, topology_manager, etc.)
+    # Pod UUID from same lines (PLEG, topology_manager, etc.)
     local pod_uid
-    pod_uid=$(grep -- "job-${jobid}" "$kubelet_journal" | \
-        grep -oP '"ID":"?\K[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}' | head -1)
+    pod_uid=$(echo "$job_lines" | grep -oP '"ID":"?\K[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}' | head -1)
 
-    # Tier 2: use pod UUID to find "container finished" line (references pod by UUID, not name)
+    # Tier 2: only if needed, one read for "container finished" + pod_uid
     if [[ -z "$aap_job_cid" ]] && [[ -n "$pod_uid" ]]; then
-        aap_job_cid=$(grep 'container finished' "$kubelet_journal" | grep "$pod_uid" | \
+        aap_job_cid=$(grep 'container finished' "$kubelet_journal" | grep -F "$pod_uid" | \
             grep -oP 'containerID="\K[a-f0-9]{64}' | head -1)
     fi
 
-    # Tier 3: PLEG ContainerStarted "Data":"{64hex}" (always present, may have multiple)
+    # Tier 3: PLEG ContainerStarted "Data":"{64hex}" from job_lines
     if [[ -z "$aap_job_cid" ]]; then
         local -a candidates
-        mapfile -t candidates < <(grep -- "job-${jobid}" "$kubelet_journal" | \
-            grep 'ContainerStarted' | grep -oP '"Data":"?\K[a-f0-9]{64}')
+        mapfile -t candidates < <(echo "$job_lines" | grep 'ContainerStarted' | grep -oP '"Data":"?\K[a-f0-9]{64}')
 
         if [[ ${#candidates[@]} -eq 1 ]]; then
             aap_job_cid="${candidates[0]}"
         elif [[ ${#candidates[@]} -gt 1 ]] && [[ -f "$dmesg_file" ]]; then
-            # Disambiguate: check which container ID appears in dmesg oom-kill cgroup paths
+            local dmesg_oom
+            dmesg_oom=$(grep -F "oom-kill" "$dmesg_file")
             for cid in "${candidates[@]}"; do
-                if grep -q "oom-kill" "$dmesg_file" && grep "oom-kill" "$dmesg_file" | grep -qF "$cid"; then
+                if [[ -n "$dmesg_oom" ]] && echo "$dmesg_oom" | grep -qF "$cid"; then
                     aap_job_cid="$cid"
                     break
                 fi
             done
-            # If no OOM match, take the first candidate (first started is typically worker)
             if [[ -z "$aap_job_cid" ]]; then
                 aap_job_cid="${candidates[0]}"
             fi
@@ -269,23 +330,21 @@ process_logs_offline() {
         highlight_output "${highlight_terms[@]}" < "$crio_log"
     fi
 
-    # Check for eviction in kubelet journal
+    # Eviction from job_lines (no extra read)
     local eviction
-    eviction=$(grep 'eviction_manager' "$kubelet_journal" | grep -- "job-${jobid}")
+    eviction=$(echo "$job_lines" | grep 'eviction_manager')
 
-    # Check for kernel OOM in dmesg, then fall back to boot journal
+    # Kernel OOM: one read of dmesg, one of boot journal only if needed
     local kernel_oom=""
     local oom_source=""
     if [[ -f "$dmesg_file" ]]; then
-        kernel_oom=$(grep 'oom-kill' "$dmesg_file" | grep -F "$aap_job_cid")
+        kernel_oom=$(grep -F "oom-kill" "$dmesg_file" | grep -F "$aap_job_cid")
         [[ -n "$kernel_oom" ]] && oom_source="$dmesg_file"
     fi
-
-    # Fallback: check full boot journal (journald persists kernel messages beyond dmesg ring buffer)
     if [[ -z "$kernel_oom" ]]; then
         local boot_journal="$sos_root/sos_commands/logs/journalctl_--no-pager_--boot"
         if [[ -f "$boot_journal" ]]; then
-            kernel_oom=$(grep 'oom-kill' "$boot_journal" | grep -F "$aap_job_cid")
+            kernel_oom=$(grep -F 'oom-kill' "$boot_journal" | grep -F "$aap_job_cid")
             [[ -n "$kernel_oom" ]] && oom_source="$boot_journal"
         fi
     fi
@@ -304,7 +363,7 @@ process_logs_offline() {
         echo ""
         echo "${RED}OOM Type:${RESET} Kernel OOM Kill (pod exceeded memory limit)"
         local pid
-        pid=$(grep -oP 'pid=\K\d+' <<< "$kernel_oom")
+        pid=$(echo "$kernel_oom" | grep -oP 'pid=\K\d+' | head -1)
         echo "${RED}PID:${RESET} $pid"
         display_oom_memory "$oom_source" "$pid" "$aap_job_cid"
         echo "${RED}OOM Logs:${RESET}"
@@ -343,8 +402,7 @@ fetch_node_journal() {
 }
 
 # Search for a job in an already-fetched journal file.
-# Outputs all results (container ID, logs, OOM detection).
-# Returns 1 if job not found in journal.
+# One grep to find cid, one to get all lines with cid (logs + OOM), one for eviction.
 search_job_in_journal() {
     local journal_file="$1"
     local jobid="$2"
@@ -364,15 +422,15 @@ search_job_in_journal() {
     echo ""
     echo "${RED}Container ID:${RESET} ${HIGHLIGHT}${aap_job_cid}${RESET}"
     echo "${RED}Container Logs:${RESET}"
-    grep -F "$aap_job_cid" "$journal_file" | highlight_output "${highlight_terms[@]}"
+    # Single read: all lines containing container ID (reused for OOM below)
+    local cid_lines
+    cid_lines=$(grep -F "$aap_job_cid" "$journal_file")
+    echo "$cid_lines" | highlight_output "${highlight_terms[@]}"
 
-    # Note: In live mode, oc adm node-logs --path=journal returns the full systemd journal,
-    # which includes kernel messages (journald imports them by default on RHCOS).
-    # This differs from offline mode where only the kubelet-filtered journal is available.
     local kernel_oom
-    kernel_oom=$(grep 'oom-kill' "$journal_file" | grep -F "$aap_job_cid")
+    kernel_oom=$(echo "$cid_lines" | grep -F 'oom-kill')
     local eviction
-    eviction=$(grep 'eviction_manager' "$journal_file" | grep -- "job-${jobid}")
+    eviction=$(grep -F 'eviction_manager' "$journal_file" | grep -- "job-${jobid}")
 
     if [[ -n "$eviction" ]]; then
         echo ""
@@ -383,7 +441,7 @@ search_job_in_journal() {
         echo ""
         echo "${RED}OOM Type:${RESET} Kernel OOM Kill (pod exceeded memory limit)"
         local pid
-        pid=$(grep -oP 'pid=\K\d+' <<< "$kernel_oom")
+        pid=$(echo "$kernel_oom" | grep -oP 'pid=\K\d+' | head -1)
         echo "${RED}PID:${RESET} $pid"
         display_oom_memory "$journal_file" "$pid" "$aap_job_cid"
         echo "${RED}OOM Logs:${RESET}"
@@ -538,26 +596,28 @@ if [[ -n "${sosreport_dir}" ]]; then
         exit 1
     fi
 
+    # One grep per sosreport to index which job IDs appear where (avoids N×M greps).
+    declare -A JOB_TO_SOS
+    for sos_root in "${sos_roots[@]}"; do
+        kubelet_journal="$sos_root/sos_commands/openshift/journalctl_--no-pager_--unit_kubelet"
+        found_jobs=$(grep -oP 'job-\K[0-9]+' "$kubelet_journal" 2>/dev/null | sort -u)
+        for j in $found_jobs; do
+            if [[ -z "${JOB_TO_SOS[$j]+x}" ]]; then
+                JOB_TO_SOS[$j]="$sos_root"
+            fi
+        done
+    done
+
     index=0
     for jobid in "${JOB_IDS[@]}"; do
         index=$((index + 1))
         print_job_separator "$jobid" "$index" "$total"
 
-        job_found=false
-        for sos_root in "${sos_roots[@]}"; do
-            kubelet_journal="$sos_root/sos_commands/openshift/journalctl_--no-pager_--unit_kubelet"
-            if grep -q -- "job-${jobid}" "$kubelet_journal" 2>/dev/null; then
-                if process_logs_offline "$sos_root" "$jobid"; then
-                    job_found=true
-                    break
-                fi
-            fi
-        done
-
-        if [[ "$job_found" == "true" ]]; then
+        sos_root="${JOB_TO_SOS[$jobid]:-}"
+        if [[ -n "$sos_root" ]] && process_logs_offline "$sos_root" "$jobid"; then
             found_count=$((found_count + 1))
         else
-            echo "Error: No job with id $jobid found in ${#sos_roots[@]} sosreport(s) searched." >&2
+            [[ -z "$sos_root" ]] && echo "Error: No job with id $jobid found in ${#sos_roots[@]} sosreport(s) searched." >&2
             missing_jobs+=("$jobid")
         fi
     done
@@ -653,3 +713,4 @@ elif [[ "$found_count" -eq 0 ]]; then
 else
     exit 2
 fi
+

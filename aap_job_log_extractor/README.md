@@ -122,6 +122,16 @@ The script recursively discovers extracted sosreport directories under the given
 
 Sosreport directories must be pre-extracted (`.tar.xz` archives are not automatically handled).
 
+### Understanding kernel OOM output
+
+When a pod is killed by the kernel for exceeding its **memory limit**, the limit applies to the **entire cgroup** (all processes in the container), not just one process. The script reports:
+
+- **Process Memory (killed)**: The single process the OOM killer chose as the victim (e.g. one `ansible-playboo` with ~1.8GB). That is why you may see "1.8GB" for the process but "6GB" for the cgroup.
+- **Cgroup Memory**: Total usage and limit for the container (all processes combined).
+- **Tasks in cgroup**: When the kernel OOM report includes a "Tasks state" dump, the script parses it and shows RSS by process name (e.g. 6× ansible-playboo, 37× ssh). This makes it clear that many processes together reached the limit—typical for AAP jobs with multiple playbook workers and SSH connections. The script supports both kernel task-line formats (e.g. `[1484104]` and `[  49040]`, where the pid may be right-padded with spaces), so names and RSS display correctly across different kernel/sosreport versions.
+
+  **Are those processes really in the same pod?** Yes. For a cgroup OOM (`constraint=CONSTRAINT_MEMCG`), the kernel only dumps tasks that belong to the OOM cgroup. In `mm/oom_kill.c`, `dump_tasks()` calls `mem_cgroup_scan_tasks(oc->memcg, dump_task, oc)` when `is_memcg_oom(oc)` is true, so the "Tasks state" list is exactly the processes in the container that hit the limit—no other pods or processes are included.
+
 ### Node Label Selector
 
 The `-l` flag allows you to restrict the brute-force node search (Phase 2) to nodes matching a specific label. This is useful for clusters with dedicated or tainted AAP worker nodes:
@@ -138,6 +148,8 @@ If no nodes match the label selector, the script exits with an error. The label 
 
 ## Requirements
 
+- **Bash 4+** is required (associative arrays, `mapfile`). On macOS the default Bash is 3.x; use a newer Bash (e.g. from Homebrew) or run on Linux/RHEL.
+
 ### Live Mode
 - OpenShift CLI (`oc`) must be installed and configured.
 - `jq` must be installed.
@@ -146,6 +158,16 @@ If no nodes match the label selector, the script exits with an error. The label 
 - No external tools required beyond standard bash utilities.
 - Extracted sosreport directories with kubelet journal data.
 
+### Verifying output (same results after changes)
+
+Run with Bash 4+ on old data, new data, and live to confirm identical behaviour:
+
+```bash
+bash aap_job_log_extractor.sh -d test_data/ -j 11115312
+bash aap_job_log_extractor.sh -d test_data/new/ -j 4
+bash aap_job_log_extractor.sh -j 3 -j 4
+```
+
 ## Color Output
 
 When run in a terminal, the script highlights matched values (job ID, container ID, `oom-kill`, `eviction`) inline within log output for easier scanning. Color is automatically disabled when output is piped or redirected. Set `NO_COLOR=1` to disable color explicitly.
@@ -153,3 +175,4 @@ When run in a terminal, the script highlights matched values (job ID, container 
 ## License
 
 [MIT](https://choosealicense.com/licenses/mit/)
+
