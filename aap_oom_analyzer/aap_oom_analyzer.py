@@ -777,7 +777,9 @@ class AapApiClient:
         if self.jobs_file:
             for j in self._load_jobs_file():
                 if j.get("unified_job_template") == template_id:
-                    name = j.get("summary_fields", {}).get("unified_job_template", {}).get("name", "unknown")
+                    sf = j.get("summary_fields")
+                    ujt = sf.get("unified_job_template") if isinstance(sf, dict) else None
+                    name = ujt.get("name", "unknown") if isinstance(ujt, dict) else "unknown"
                     playbook = j.get("playbook", "unknown")
                     result = f"{name}|{playbook}"
                     self.template_cache[tid] = result
@@ -963,11 +965,17 @@ class CorrelationResult:
 
 
 def _extract_job_entry(j: dict) -> dict:
+    sf = j.get("summary_fields")
+    if not isinstance(sf, dict):
+        sf = {}
+    ujt = sf.get("unified_job_template")
+    if not isinstance(ujt, dict):
+        ujt = {}
     return {
         "job_id": j.get("id", 0),
         "status": _normalize(j.get("status")),
         "tmpl_id": j.get("unified_job_template", 0),
-        "tmpl_name": _normalize(j.get("summary_fields", {}).get("unified_job_template", {}).get("name")),
+        "tmpl_name": _normalize(ujt.get("name")),
         "playbook": _normalize(j.get("playbook")),
         "explanation": j.get("job_explanation", ""),
     }
@@ -1054,7 +1062,9 @@ def enrich_job_pod_ooms(job_ooms: List[OomRecord], api: AapApiClient):
         if not job_json:
             continue
 
-        tmpl_name = job_json.get("summary_fields", {}).get("unified_job_template", {}).get("name", "")
+        sf = job_json.get("summary_fields")
+        ujt = sf.get("unified_job_template") if isinstance(sf, dict) else None
+        tmpl_name = ujt.get("name", "") if isinstance(ujt, dict) else ""
         playbook = job_json.get("playbook", "")
         tmpl_id = job_json.get("unified_job_template")
 
